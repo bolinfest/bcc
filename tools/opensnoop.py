@@ -74,6 +74,12 @@ struct data_t {
     char fname[NAME_MAX];
 };
 
+// If a[0] == 0, then there is nothing to filter.
+// If a[0] == 1, then filter by the pid in a[1].
+// If a[0] == 2, then filter by the tid in a[2].
+// TODO(mbolin): Use a single u64 to store this data.
+BPF_ARRAY(filter, u32, 3);
+
 BPF_HASH(infotmp, u64, struct val_t);
 BPF_PERF_OUTPUT(events);
 
@@ -84,7 +90,25 @@ int trace_entry(struct pt_regs *ctx, int dfd, const char __user *filename)
     u32 pid = id >> 32; // PID is higher part
     u32 tid = id;       // Cast and get the lower part
 
-    FILTER
+    u32 zero_index = 0;
+    u32 one_index = 1;
+    u32 two_index = 2;
+
+    u32 zero = 0;
+    u32 *filter_index = filter.lookup_or_init(&zero_index, &zero);
+
+    if (*filter_index == 1) {
+        u32 *filter_pid = filter.lookup_or_init(&one_index, &zero);
+        if (pid != *filter_pid) {
+            return 0;
+        }
+    } else if (*filter_index == 2) {
+        u32 *filter_tid = filter.lookup_or_init(&two_index, &zero);
+        if (tid != *filter_tid) {
+            return 0;
+        }
+    }
+
     if (bpf_get_current_comm(&val.comm, sizeof(val.comm)) == 0) {
         val.id = id;
         val.ts = bpf_ktime_get_ns();
@@ -120,21 +144,28 @@ int trace_return(struct pt_regs *ctx)
     return 0;
 }
 """
-if args.tid:  # TID trumps PID
-    bpf_text = bpf_text.replace('FILTER',
-        'if (tid != %s) { return 0; }' % args.tid)
-elif args.pid:
-    bpf_text = bpf_text.replace('FILTER',
-        'if (pid != %s) { return 0; }' % args.pid)
-else:
-    bpf_text = bpf_text.replace('FILTER', '')
+
 if debug or args.ebpf:
     print(bpf_text)
     if args.ebpf:
         exit()
 
 # initialize BPF
-b = BPF(text=bpf_text)
+b = BPF(text=bpf_text, debug=0)
+
+if args.tid:
+    b["filter"][ct.c_int(0)] = ct.c_int(2)
+    b["filter"][ct.c_int(1)] = ct.c_int(0)
+    b["filter"][ct.c_int(2)] = ct.c_int(int(args.tid))
+elif args.pid:
+    b["filter"][ct.c_int(0)] = ct.c_int(1)
+    b["filter"][ct.c_int(1)] = ct.c_int(int(args.pid))
+    b["filter"][ct.c_int(2)] = ct.c_int(0)
+else:
+    b["filter"][ct.c_int(0)] = ct.c_int(0)
+    b["filter"][ct.c_int(1)] = ct.c_int(0)
+    b["filter"][ct.c_int(2)] = ct.c_int(0)
+
 b.attach_kprobe(event="do_sys_open", fn_name="trace_entry")
 b.attach_kretprobe(event="do_sys_open", fn_name="trace_return")
 
